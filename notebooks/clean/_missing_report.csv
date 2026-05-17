@@ -1,0 +1,11 @@
+table,column,missing,pct
+app_events,order_id,144,22.5
+complaints,compensation_amount,16,5.0
+customers,loyalty_score,20,3.08
+customers,preferred_channel,13,2.0
+deliveries,delivery_completed_at,19,2.0
+deliveries,customer_rating_post_delivery,14,1.47
+drivers,training_score,7,4.12
+incidents,resolved_hours,17,6.07
+orders,booking_channel,25,2.0
+vehicles,battery_health_pct,4,3.33

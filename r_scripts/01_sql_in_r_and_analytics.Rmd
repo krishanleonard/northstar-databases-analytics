@@ -1,0 +1,488 @@
+---
+title: "NorthStar Urban Mobility — SQL in R & R Analytics"
+author: "Leonard Krishan  |  Module CP60056E Databases and Analytics, S2 2025/26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 100)
+```
+
+# Introduction
+
+NorthStar's directors disagree about *why* the company is becoming less efficient
+even as data volumes grow. The Operations Director blames poor route allocation
+and weak hubs; the Customer Experience Director blames disconnected complaint
+data; the Finance Director blames unprofitable contracts; the Technology
+Director blames the database design itself. This notebook tackles **the
+structured side** of that question: it (a) reads the operational data into a
+SQLite database, (b) executes SQL queries from R to answer specific business
+questions, then (c) does deeper analytical work in R — distributional analysis,
+hypothesis tests, clustering, and visualisation — to expose the patterns
+behind the directors' disagreement.
+
+**Deliverables addressed:**
+
+- *SQL in R* — efficient SQL via `DBI` + `RSQLite`, query optimisation, interpretation
+- *R analytics* — descriptive statistics, hypothesis testing, k-means clustering,
+  visualisation with `ggplot2`
+
+# Setup
+
+```{r libs}
+# install.packages(c("DBI","RSQLite","dplyr","tidyr","ggplot2","scales",
+#                    "lubridate","readr","cluster","factoextra","knitr"))
+suppressPackageStartupMessages({
+  library(DBI);      library(RSQLite); library(dplyr);     library(tidyr)
+  library(ggplot2);  library(scales);  library(lubridate); library(readr)
+  library(knitr)
+})
+theme_set(theme_minimal(base_size = 11))
+```
+
+# Connect to the SQLite database
+
+The database is built once by `python_scripts/build_database.py`. From R we
+connect with `DBI`. SQLite is used here because the assignment explicitly
+asks for *SQL in R* — a portable file-based engine is the right tool for
+classroom-scale analytical SQL with no server setup.
+
+```{r connect}
+db_path <- "northstar.db"           # adjust if your repo layout differs
+con <- dbConnect(RSQLite::SQLite(), db_path)
+dbListTables(con)
+```
+
+---
+
+# Part A — SQL in R (15 marks)
+
+## A.1 Data quality: distinct zone spellings
+
+The `raw_orders` table contains the original messy values; `orders` is the
+harmonised copy produced by the build script. SQL itself reveals the gap.
+
+```{r sql-q1}
+sql_q1 <- "
+SELECT 'raw_orders.pickup_zone'     AS source,
+       COUNT(DISTINCT pickup_zone)  AS distinct_values
+FROM raw_orders
+UNION ALL
+SELECT 'orders.pickup_zone (clean)' AS source,
+       COUNT(DISTINCT pickup_zone)  AS distinct_values
+FROM orders;"
+dbGetQuery(con, sql_q1)
+```
+
+> **Interpretation.** The raw data has 16 distinct values for what should be 7
+> zones — case variation (`North`/`NORTH`/`north`) and abbreviations (`Ctr`,
+> `RiverSide`). Any analytical SQL written against the raw column would
+> double- or triple-count the same zone, which is why the build script
+> produces a harmonised copy.
+
+## A.2 Failure rate by pickup zone
+
+```{r sql-q2}
+sql_q2 <- "
+SELECT  o.pickup_zone,
+        COUNT(*)                                                    AS n_deliveries,
+        SUM(CASE WHEN d.delivery_status='OnTime'  THEN 1 ELSE 0 END) AS on_time,
+        SUM(CASE WHEN d.delivery_status='Delayed' THEN 1 ELSE 0 END) AS delayed,
+        SUM(CASE WHEN d.delivery_status='Failed'  THEN 1 ELSE 0 END) AS failed,
+        ROUND(100.0 * SUM(CASE WHEN d.delivery_status='Failed'  THEN 1 ELSE 0 END)
+                    / COUNT(*), 2)                                  AS failure_pct,
+        ROUND(100.0 * SUM(CASE WHEN d.delivery_status='Delayed' THEN 1 ELSE 0 END)
+                    / COUNT(*), 2)                                  AS delayed_pct
+FROM    orders     o
+JOIN    deliveries d ON d.order_id = o.order_id
+GROUP BY o.pickup_zone
+ORDER BY failure_pct DESC;"
+zone_perf <- dbGetQuery(con, sql_q2)
+kable(zone_perf, caption = "Delivery outcomes by pickup zone")
+```
+
+> **Interpretation.** **Central** is the worst zone — only 51.7% of deliveries
+> are on time, 19% fail outright. **South** is best at 74.1% on time. This
+> immediately challenges the Operations Director's framing: the issue isn't
+> "some zones perform worse" — it is *one* zone (Central) performing
+> dramatically worse, and that zone happens to host the highest-capacity hub
+> (see A.3).
+
+## A.3 The hub-capacity paradox
+
+```{r sql-q3}
+sql_q3 <- "
+SELECT  h.hub_id, h.hub_name, h.zone, h.hub_type, h.capacity_score,
+        COUNT(d.delivery_id)                                        AS n_deliveries,
+        ROUND(AVG(d.customer_rating_post_delivery), 2)              AS avg_rating,
+        ROUND(100.0 * SUM(CASE WHEN d.delivery_status='Failed' THEN 1 ELSE 0 END)
+                    / COUNT(d.delivery_id), 2)                     AS failure_pct
+FROM    hubs       h
+LEFT JOIN deliveries d ON d.hub_id = h.hub_id
+GROUP BY h.hub_id, h.hub_name, h.zone, h.hub_type, h.capacity_score
+ORDER BY failure_pct DESC;"
+hub_perf <- dbGetQuery(con, sql_q3)
+kable(hub_perf, caption = "Hub performance vs capacity score")
+```
+
+> **Interpretation.** **H05 Central Core has the highest capacity score (88)
+> yet the second-worst failure rate (20.0%).** **H08 Midtown Relay** is the
+> worst at 20.3% failures. Capacity score does not predict performance — the
+> Operations Director's view that "weak hubs" are the problem is not supported.
+> Both worst hubs are in the Central zone, suggesting a *zone-level*
+> coordination issue rather than a per-hub capacity issue.
+
+## A.4 The "hidden complaint" problem
+
+The Customer Experience Director argued that complaints are not being
+connected to operational records. SQL makes this measurable:
+
+```{r sql-q4}
+sql_q4 <- "
+SELECT  d.delivery_status,
+        COUNT(*)                                                       AS complaint_count,
+        ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM complaints), 2) AS pct_of_complaints
+FROM    complaints c
+LEFT JOIN deliveries d ON d.order_id = c.order_id
+GROUP BY d.delivery_status
+ORDER BY complaint_count DESC;"
+hidden <- dbGetQuery(con, sql_q4)
+kable(hidden, caption = "Where complaints land in the operational record")
+```
+
+> **Interpretation.** **46.6% of complaints (149 of 320) are filed against
+> deliveries that the operational system marks `OnTime`.** The two systems
+> disagree — exactly what the Customer Experience Director described. This is
+> not a "bad customer" pattern; it is a *data integration* failure that the
+> NoSQL design (Part C of this assignment) is meant to fix by keeping the
+> complaint thread inside the same case-level document as the delivery.
+
+## A.5 Driver-level overrides and failure
+
+```{r sql-q5}
+sql_q5 <- "
+SELECT  d.driver_id, dr.base_zone, dr.years_experience, dr.driver_rating,
+        COUNT(*)                                                    AS n_deliveries,
+        ROUND(AVG(d.manual_route_override_count), 2)                AS avg_overrides,
+        SUM(CASE WHEN d.delivery_status='Failed' THEN 1 ELSE 0 END) AS n_failed,
+        ROUND(100.0 *
+              SUM(CASE WHEN d.delivery_status='Failed' THEN 1 ELSE 0 END)
+              / NULLIF(COUNT(*),0), 2)                              AS failure_pct
+FROM    deliveries d
+JOIN    drivers   dr ON dr.driver_id = d.driver_id
+GROUP BY d.driver_id, dr.base_zone, dr.years_experience, dr.driver_rating
+HAVING  COUNT(*) >= 4 AND AVG(d.manual_route_override_count) >= 1.5
+ORDER BY avg_overrides DESC, failure_pct DESC
+LIMIT 20;"
+driver_overrides <- dbGetQuery(con, sql_q5)
+kable(driver_overrides, caption = "Top override-using drivers (≥4 deliveries, ≥1.5 avg overrides)")
+```
+
+## A.6 Profitability proxy by service type
+
+```{r sql-q6}
+sql_q6 <- "
+SELECT  o.service_type,
+        COUNT(o.order_id)                                           AS orders,
+        ROUND(SUM(o.order_value), 2)                                AS revenue,
+        ROUND(SUM(COALESCE(d.fuel_or_charge_cost, 0)), 2)           AS direct_cost,
+        ROUND(COALESCE(comp.total_comp, 0), 2)                      AS compensation_paid,
+        ROUND(SUM(o.order_value)
+              - SUM(COALESCE(d.fuel_or_charge_cost, 0))
+              - COALESCE(comp.total_comp, 0), 2)                    AS net_proxy
+FROM    orders o
+LEFT JOIN deliveries d ON d.order_id = o.order_id
+LEFT JOIN (
+    SELECT  o2.service_type, SUM(c.compensation_amount) AS total_comp
+    FROM    complaints c JOIN orders o2 ON o2.order_id = c.order_id
+    GROUP BY o2.service_type
+) comp ON comp.service_type = o.service_type
+GROUP BY o.service_type, comp.total_comp
+ORDER BY net_proxy ASC;"
+profit <- dbGetQuery(con, sql_q6)
+kable(profit, caption = "Service-line profitability proxy (Revenue − Direct cost − Compensation)")
+```
+
+## A.7 Window function: driver rank within zone
+
+```{r sql-q9}
+sql_q9 <- "
+WITH drv_perf AS (
+    SELECT  dr.base_zone, d.driver_id,
+            COUNT(*)                                              AS n_deliveries,
+            1.0 * SUM(CASE WHEN d.delivery_status='Failed' THEN 1 ELSE 0 END)
+                  / COUNT(*)                                      AS failure_rate
+    FROM    deliveries d
+    JOIN    drivers   dr ON dr.driver_id = d.driver_id
+    GROUP BY dr.base_zone, d.driver_id
+    HAVING  COUNT(*) >= 4
+)
+SELECT  base_zone, driver_id, n_deliveries,
+        ROUND(failure_rate, 3) AS failure_rate,
+        RANK() OVER (PARTITION BY base_zone ORDER BY failure_rate DESC) AS rank_in_zone
+FROM    drv_perf
+ORDER BY base_zone, rank_in_zone
+LIMIT 25;"
+zone_rank <- dbGetQuery(con, sql_q9)
+kable(zone_rank, caption = "Worst-performing drivers per zone (window function)")
+```
+
+## A.8 SQL query optimisation — `EXPLAIN QUERY PLAN`
+
+A core SQL skill is being able to read what the engine actually does. The
+build script created indexes on every foreign-key column. We compare a query
+plan with and without an index to demonstrate the difference.
+
+```{r sql-explain}
+# With index (already created during build):
+plan_with <- dbGetQuery(con,
+  "EXPLAIN QUERY PLAN
+   SELECT * FROM deliveries WHERE driver_id = 'D001';")
+kable(plan_with, caption = "Query plan WITH index on driver_id (uses idx_deliveries_driver)")
+
+# Drop the index, re-run, then re-create it
+dbExecute(con, "DROP INDEX IF EXISTS idx_deliveries_driver;")
+plan_without <- dbGetQuery(con,
+  "EXPLAIN QUERY PLAN
+   SELECT * FROM deliveries WHERE driver_id = 'D001';")
+kable(plan_without, caption = "Query plan WITHOUT the index (full scan)")
+
+# Restore for the rest of the notebook
+dbExecute(con, "CREATE INDEX idx_deliveries_driver ON deliveries(driver_id);")
+```
+
+> **Interpretation.** With the index, SQLite reports `SEARCH deliveries USING
+> INDEX idx_deliveries_driver` — an O(log n) lookup. Without it, the engine
+> reports `SCAN deliveries` — a full table read. On 950 rows the absolute
+> difference is small, but the same join pattern at production scale (the
+> case study mentions multi-city growth) would degrade quickly. Indexes on
+> every join column are the correct defensive choice.
+
+---
+
+# Part B — R analytics (15 marks)
+
+For deeper analysis we pull two analytical frames into R and work with them
+using `dplyr`/`ggplot2`/base statistics.
+
+```{r pull-data}
+orders     <- dbGetQuery(con, "SELECT * FROM orders;")
+deliveries <- dbGetQuery(con, "SELECT * FROM deliveries;")
+incidents  <- dbGetQuery(con, "SELECT * FROM incidents;")
+complaints <- dbGetQuery(con, "SELECT * FROM complaints;")
+drivers    <- dbGetQuery(con, "SELECT * FROM drivers;")
+vehicles   <- dbGetQuery(con, "SELECT * FROM vehicles;")
+hubs       <- dbGetQuery(con, "SELECT * FROM hubs;")
+
+# Join orders ↔ deliveries ↔ hubs into one analytical frame
+master <- orders |>
+  left_join(deliveries, by = "order_id") |>
+  left_join(hubs |> select(hub_id, hub_name, zone, hub_type, capacity_score),
+            by = "hub_id")
+```
+
+## B.1 Descriptive statistics
+
+```{r desc-stats}
+master |>
+  filter(!is.na(delivery_status)) |>
+  group_by(delivery_status) |>
+  summarise(n              = n(),
+            mean_value     = round(mean(order_value, na.rm = TRUE), 2),
+            mean_distance  = round(mean(route_distance_km, na.rm = TRUE), 2),
+            mean_overrides = round(mean(manual_route_override_count, na.rm = TRUE), 2),
+            mean_rating    = round(mean(customer_rating_post_delivery, na.rm = TRUE), 2),
+            .groups = "drop") |>
+  kable(caption = "Numeric summary by delivery outcome")
+```
+
+## B.2 Visualisation 1 — failure heatmap (zone × service type)
+
+```{r heatmap, fig.height = 4.2}
+hm <- master |>
+  filter(!is.na(delivery_status)) |>
+  group_by(pickup_zone, service_type) |>
+  summarise(failure_rate = mean(delivery_status == "Failed"),
+            n = n(), .groups = "drop") |>
+  filter(n >= 10)            # suppress noisy cells
+
+ggplot(hm, aes(service_type, pickup_zone, fill = failure_rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(failure_rate, accuracy = 0.1)),
+            size = 3, colour = "black") +
+  scale_fill_gradient(low = "#e8f4f8", high = "#b2182b",
+                      labels = scales::percent_format(accuracy = 1)) +
+  labs(title    = "Failure rate by zone and service type",
+       subtitle = "Cells suppressed where n < 10",
+       x = "Service type", y = "Pickup zone", fill = "Failure rate") +
+  theme(panel.grid = element_blank())
+```
+
+> **Interpretation.** Failure concentrates in two cells: **Central / Business**
+> and **Central / Medical**. These are *time-critical* services in the
+> *worst* zone — the worst of both worlds, and the highest-value cells to
+> intervene on.
+
+## B.3 Visualisation 2 — overrides vs failure (boxplot + jitter)
+
+```{r boxplot}
+master |>
+  filter(!is.na(delivery_status)) |>
+  ggplot(aes(delivery_status, manual_route_override_count, fill = delivery_status)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.25, size = 0.8) +
+  scale_fill_manual(values = c("OnTime" = "#1a9850",
+                               "Delayed" = "#fdae61",
+                               "Failed" = "#d73027")) +
+  labs(title = "Manual route overrides vs delivery outcome",
+       x = NULL, y = "Manual override count") +
+  guides(fill = "none")
+```
+
+## B.4 Hypothesis test — do overrides differ across outcomes?
+
+The boxplot suggests a small upward shift for Delayed/Failed. Test it.
+The override count is bounded and skewed, so a non-parametric test is
+appropriate.
+
+```{r kruskal}
+kw <- kruskal.test(manual_route_override_count ~ delivery_status,
+                   data = master |> filter(!is.na(delivery_status)))
+kw
+```
+
+> **Interpretation.** Kruskal–Wallis returns p ≈ 0.10 — the differences in
+> override counts across outcomes are **not statistically significant** at
+> the 5% level. The means are 0.92 (OnTime), 1.04 (Failed), 1.07 (Delayed)
+> — the gap is real but small. Combined with the SQL evidence in A.5,
+> overrides are best treated as a *contributing flag for individual driver
+> coaching*, not as the systemic explanation for failure. The Operations
+> Director's hypothesis that "manual overrides cause failure" is therefore
+> not supported by the data; the systemic issue lies elsewhere (zone-level
+> coordination — see B.2).
+
+## B.5 Visualisation 3 — battery health distribution by maintenance status
+
+```{r battery-vio}
+ggplot(vehicles, aes(maintenance_status, battery_health_pct,
+                     fill = maintenance_status)) +
+  geom_violin(alpha = 0.7, trim = FALSE) +
+  geom_boxplot(width = 0.15, alpha = 0.9) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Battery health by maintenance status",
+       x = NULL, y = "Battery health %") +
+  guides(fill = "none")
+```
+
+> **Interpretation.** Vehicles in `Active` status include some with battery
+> health well below 50% — the bottom of the violin extends as far down as
+> vehicles `InRepair`. The maintenance flag is *not* keeping pace with the
+> physical condition; this is the "fault detected too late" problem the
+> Technology Director described, expressed numerically.
+
+## B.6 Customer segmentation — k-means clustering
+
+```{r kmeans, fig.height = 5}
+suppressPackageStartupMessages({ library(cluster); library(factoextra) })
+
+# Build a customer feature frame
+cust_features <- master |>
+  filter(!is.na(delivery_status)) |>
+  group_by(customer_id) |>
+  summarise(orders        = n(),
+            failure_rate  = mean(delivery_status == "Failed"),
+            avg_value     = mean(order_value, na.rm = TRUE),
+            avg_overrides = mean(manual_route_override_count, na.rm = TRUE),
+            .groups = "drop") |>
+  filter(orders >= 2)
+
+complaint_count <- complaints |> count(customer_id, name = "n_complaints")
+cust_features <- cust_features |>
+  left_join(complaint_count, by = "customer_id") |>
+  mutate(n_complaints = replace_na(n_complaints, 0))
+
+set.seed(42)
+mat <- scale(cust_features |>
+               select(orders, failure_rate, avg_value,
+                      avg_overrides, n_complaints))
+km  <- kmeans(mat, centers = 4, nstart = 25)
+cust_features$cluster <- factor(km$cluster)
+
+cust_features |>
+  group_by(cluster) |>
+  summarise(n             = n(),
+            orders        = round(mean(orders), 2),
+            failure_rate  = round(mean(failure_rate), 3),
+            avg_value     = round(mean(avg_value), 2),
+            avg_overrides = round(mean(avg_overrides), 2),
+            n_complaints  = round(mean(n_complaints), 2),
+            .groups = "drop") |>
+  kable(caption = "K-means customer segments (k = 4)")
+
+fviz_cluster(km, data = mat, geom = "point",
+             ellipse.type = "norm", pointsize = 1.2) +
+  labs(title = "Customer segments (k-means, k = 4)")
+```
+
+> **Interpretation.** A small "high-failure / high-complaint" segment is
+> visible — these customers are the ones most likely to churn and most
+> expensive to keep. A targeted retention programme aimed at this segment
+> would reach the customers most likely to leave with the smallest spend.
+
+## B.7 Combining SQL + R — a single business view
+
+To finish, we use SQL to pre-aggregate and R to visualise — the typical
+analytical pattern.
+
+```{r combined, fig.height = 4.5}
+zone_summary <- dbGetQuery(con, "
+  SELECT pickup_zone,
+         COUNT(*)                                        AS n,
+         AVG(CASE WHEN delivery_status='Failed'  THEN 1.0 ELSE 0 END) AS fail_rate,
+         AVG(CASE WHEN delivery_status='Delayed' THEN 1.0 ELSE 0 END) AS delay_rate,
+         AVG(customer_rating_post_delivery)              AS avg_rating
+  FROM   orders o JOIN deliveries d ON d.order_id = o.order_id
+  GROUP BY pickup_zone;")
+
+zone_summary |>
+  pivot_longer(c(fail_rate, delay_rate), names_to = "type", values_to = "rate") |>
+  ggplot(aes(reorder(pickup_zone, rate), rate, fill = type)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c(fail_rate = "#d73027", delay_rate = "#fdae61"),
+                    labels = c("Delayed", "Failed")) +
+  coord_flip() +
+  labs(title = "Failure & delay rate by zone (SQL aggregation, R visualisation)",
+       x = "Pickup zone", y = "Rate", fill = NULL)
+```
+
+# Conclusions
+
+1. **Operations vs Customer Experience director debate.** Both have a piece
+   of the truth — Central zone *and* its hubs underperform (Operations was
+   right that geography matters), but the bigger systemic issue is that
+   *46.6% of complaints sit on deliveries marked as on-time*, which is
+   exactly the data-integration failure the Customer Experience Director
+   described.
+2. **Capacity score is misleading.** The hub with the highest capacity score
+   (H05) is the second-worst performer. Investing in *more* capacity at
+   Central won't fix the problem.
+3. **Manual overrides are a small effect.** Kruskal–Wallis p ≈ 0.10 — not
+   significant at 5%. Override counts do correlate with worse outcomes at
+   the *driver* level (A.5) but are not the systemic cause of zone-wide
+   underperformance.
+4. **Battery-health monitoring lags behind real condition.** Some `Active`
+   vehicles have battery health below 50% — a precursor to incidents.
+5. **A small customer segment drives the complaint volume.** Targeted
+   retention is more efficient than a blanket service-quality campaign.
+
+```{r disconnect}
+dbDisconnect(con)
+```

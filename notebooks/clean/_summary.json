@@ -1,0 +1,17 @@
+{
+  "records": {
+    "hubs": 8,
+    "customers": 650,
+    "drivers": 170,
+    "vehicles": 120,
+    "orders": 1250,
+    "deliveries": 950,
+    "incidents": 280,
+    "complaints": 320,
+    "app_events": 640
+  },
+  "failure_pct_total": 10.56,
+  "pct_complaints_on_ontime": 46.56,
+  "order_value_at_risk_gbp": 29975.83,
+  "compensation_paid_gbp": 6158.19
+}
